@@ -31,8 +31,14 @@ int main(int argc, char* argv[]) {
     }
 
     if (child == 0) {
-        if (unshare(CLONE_NEWNS) != 0) {
-            std::perror("minbox-runtime: unshare mount namespace");
+        if (unshare(CLONE_NEWNS | CLONE_NEWUTS) != 0) {
+            std::perror("minbox-runtime: unshare mount/UTS namespaces");
+            _exit(1);
+        }
+
+        constexpr char containerHostname[] = "minbox";
+        if (sethostname(containerHostname, sizeof(containerHostname) - 1) != 0) {
+            std::perror("minbox-runtime: sethostname");
             _exit(1);
         }
 
