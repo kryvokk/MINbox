@@ -1,6 +1,9 @@
-
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <sched.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 int main(int argc, char* argv[]) {
@@ -15,18 +18,52 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
-    if (chroot(argv[2]) != 0) {
-        std::perror("minbox-runtime: chroot");
+    if (unshare(CLONE_NEWPID) != 0) {
+        std::perror("minbox-runtime: unshare");
         return 1;
     }
 
-    if (chdir("/") != 0) {
-        std::perror("minbox-runtime: chdir");
+    const pid_t child = fork();
+    if (child == -1) {
+        std::perror("minbox-runtime: fork");
         return 1;
     }
 
-    execvp(argv[4], &argv[4]);
+    if (child == 0) {
+        if (chroot(argv[2]) != 0) {
+            std::perror("minbox-runtime: chroot");
+            _exit(1);
+        }
 
-    std::perror("minbox-runtime: execvp");
-    return 127;
+        if (chdir("/") != 0) {
+            std::perror("minbox-runtime: chdir");
+            _exit(1);
+        }
+
+        execvp(argv[4], &argv[4]);
+
+        std::perror("minbox-runtime: execvp");
+        _exit(127);
+    }
+
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited == -1 && errno == EINTR);
+
+    if (waited == -1) {
+        std::perror("minbox-runtime: waitpid");
+        return 1;
+    }
+
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+
+    return 1;
 }
