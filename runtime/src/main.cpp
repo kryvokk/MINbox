@@ -4,16 +4,42 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sched.h>
+#include <signal.h>
 #include <string>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace {
 
 constexpr char cgroupRoot[] = "/sys/fs/cgroup";
+volatile sig_atomic_t receivedSignal = 0;
+
+void recordSignal(int signalNumber) {
+    if (receivedSignal == 0) {
+        receivedSignal = signalNumber;
+    }
+}
+
+bool installSignalHandlers() {
+    struct sigaction action {};
+    action.sa_handler = recordSignal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+
+    constexpr int signals[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT};
+    for (const int signalNumber : signals) {
+        if (sigaction(signalNumber, &action, nullptr) != 0) {
+            std::perror("minbox-runtime: sigaction");
+            return false;
+        }
+    }
+    return true;
+}
 
 bool writeControl(const std::string& path, const std::string& value) {
     const int fd = open(path.c_str(), O_WRONLY | O_CLOEXEC);
@@ -108,6 +134,19 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 
+    if (!installSignalHandlers()) {
+        return 1;
+    }
+
+    const pid_t parentPid = getppid();
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
+        std::perror("minbox-runtime: prctl PR_SET_PDEATHSIG");
+        return 1;
+    }
+    if (getppid() != parentPid) {
+        recordSignal(SIGTERM);
+    }
+
     std::string cgroupPath;
     const bool useCgroup = memoryLimit != nullptr || pidsLimit != nullptr;
     if (useCgroup) {
@@ -116,6 +155,12 @@ int main(int argc, char* argv[]) {
         if (!createCgroup(cgroupPath, memoryLimit, pidsLimit)) {
             return 1;
         }
+    }
+    if (receivedSignal != 0) {
+        if (useCgroup) {
+            removeCgroup(cgroupPath);
+        }
+        return 128 + receivedSignal;
     }
 
     int gate[2] = {-1, -1};
@@ -215,17 +260,66 @@ int main(int argc, char* argv[]) {
     }
 
     int status = 0;
-    pid_t waited;
-    do {
+    pid_t waited = -1;
+    int waitError = 0;
+    bool reaped = false;
+    while (!reaped) {
+        if (receivedSignal != 0) {
+            if (kill(child, receivedSignal) != 0 && errno != ESRCH) {
+                std::perror("minbox-runtime: forward signal to container");
+            }
+
+            constexpr int graceAttempts = 20;
+            for (int attempt = 0; attempt < graceAttempts; ++attempt) {
+                waited = waitpid(child, &status, WNOHANG);
+                if (waited == child) {
+                    reaped = true;
+                    break;
+                }
+                if (waited == -1 && errno != EINTR) {
+                    waitError = errno;
+                    break;
+                }
+
+                const struct timespec delay = {0, 100000000};
+                nanosleep(&delay, nullptr);
+            }
+
+            if (!reaped) {
+                if (kill(child, SIGKILL) != 0 && errno != ESRCH) {
+                    std::perror("minbox-runtime: force stop container");
+                }
+                do {
+                    waited = waitpid(child, &status, 0);
+                } while (waited == -1 && errno == EINTR);
+                reaped = waited == child;
+                if (!reaped) {
+                    waitError = errno;
+                }
+            }
+            break;
+        }
+
         waited = waitpid(child, &status, 0);
-    } while (waited == -1 && errno == EINTR);
+        if (waited == child) {
+            reaped = true;
+        } else if (waited == -1 && errno != EINTR) {
+            waitError = errno;
+            break;
+        }
+    }
 
     if (useCgroup) {
         removeCgroup(cgroupPath);
     }
-    if (waited == -1) {
+    if (!reaped) {
+        errno = waitError;
         std::perror("minbox-runtime: waitpid");
         return 1;
+    }
+
+    if (receivedSignal != 0) {
+        return 128 + receivedSignal;
     }
 
     if (WIFEXITED(status)) {
