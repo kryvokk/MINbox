@@ -2,13 +2,15 @@ package cli
 
 import (
 	"fmt"
+	"math"
 	"strconv"
+	"strings"
 
 	"github.com/kryvokk/MINbox/internal/runtimeclient"
 )
 
 func Run(args []string) error {
-	const usage = "usage: minbox run --rootfs <path> [--memory <bytes>] [--pids <count>] -- <command> [args...]"
+	const usage = "usage: minbox run --rootfs <path> [--memory <size>] [--pids <count>] -- <command> [args...]"
 
 	if len(args) < 4 || args[0] != "run" {
 		return fmt.Errorf("%s", usage)
@@ -34,9 +36,9 @@ func Run(args []string) error {
 			if hasMemory {
 				return fmt.Errorf("%s", usage)
 			}
-			value, err := strconv.ParseUint(args[i+1], 10, 64)
-			if err != nil || value == 0 {
-				return fmt.Errorf("--memory must be a positive byte count")
+			value, err := parseMemorySize(args[i+1])
+			if err != nil {
+				return fmt.Errorf("invalid --memory value %q: %w", args[i+1], err)
 			}
 			memoryBytes, hasMemory = value, true
 		case "--pids":
@@ -62,4 +64,48 @@ func Run(args []string) error {
 	}
 
 	return runtimeclient.Run(rootfs, memoryBytes, hasMemory, pidsLimit, hasPids, command)
+}
+
+func parseMemorySize(input string) (uint64, error) {
+	numberEnd := 0
+	for numberEnd < len(input) && input[numberEnd] >= '0' && input[numberEnd] <= '9' {
+		numberEnd++
+	}
+	if numberEnd == 0 {
+		return 0, fmt.Errorf("expected a positive integer with an optional unit (for example 64M or 128MiB)")
+	}
+
+	value, err := strconv.ParseUint(input[:numberEnd], 10, 64)
+	if err != nil || value == 0 {
+		return 0, fmt.Errorf("expected a positive integer with an optional unit (for example 64M or 128MiB)")
+	}
+
+	var multiplier uint64
+	switch strings.ToUpper(input[numberEnd:]) {
+	case "", "B":
+		multiplier = 1
+	case "K", "KIB":
+		multiplier = 1 << 10
+	case "M", "MIB":
+		multiplier = 1 << 20
+	case "G", "GIB":
+		multiplier = 1 << 30
+	case "T", "TIB":
+		multiplier = 1 << 40
+	case "KB":
+		multiplier = 1000
+	case "MB":
+		multiplier = 1000 * 1000
+	case "GB":
+		multiplier = 1000 * 1000 * 1000
+	case "TB":
+		multiplier = 1000 * 1000 * 1000 * 1000
+	default:
+		return 0, fmt.Errorf("unknown unit; use B, K/M/G/T, KiB/MiB/GiB/TiB, or KB/MB/GB/TB")
+	}
+
+	if value > math.MaxUint64/multiplier {
+		return 0, fmt.Errorf("size is too large")
+	}
+	return value * multiplier, nil
 }
